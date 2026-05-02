@@ -4,23 +4,20 @@ const NodeCache = require("node-cache")
 
 // Initialize cache with different TTLs
 const cache = new NodeCache({ stdTTL: 300, checkperiod: 120 })
-const dataCache = new NodeCache({ stdTTL: 30, checkperiod: 60 }) // Shorter TTL for filtered data
+const dataCache = new NodeCache({ stdTTL: 30, checkperiod: 60 })
 
-// Helper: Convert DD/MM/YYYY or DD/MM/YYYY HH:MM:SS to YYYY-MM-DD (optimized)
+// Helper: Convert DD/MM/YYYY to YYYY-MM-DD (optimized)
 function convertToStandardDate(dateStr) {
   if (!dateStr) return null
   
   const str = dateStr.toString().trim()
   if (str === "") return null
   
-  // Remove time part (everything after space)
-  let datePart = str.split(' ')[0]
+  const datePart = str.split(' ')[0]
   
-  // Check if format is DD/MM/YYYY
   if (datePart.includes('/')) {
     const parts = datePart.split('/')
     if (parts.length === 3) {
-      // parts[0] = day, parts[1] = month, parts[2] = year
       const year = parts[2]
       const month = parts[1].padStart(2, '0')
       const day = parts[0].padStart(2, '0')
@@ -28,7 +25,6 @@ function convertToStandardDate(dateStr) {
     }
   }
   
-  // Check if already in YYYY-MM-DD format
   if (datePart.includes('-')) {
     return datePart
   }
@@ -36,17 +32,14 @@ function convertToStandardDate(dateStr) {
   return null
 }
 
-// Helper: Get date only in YYYY-MM-DD format from any input
 function getDateOnly(dateString) {
   if (!dateString || dateString.toString().trim() === "") return null
   
   const str = dateString.toString().trim()
   
-  // Try direct conversion first
   let converted = convertToStandardDate(str)
   if (converted) return converted
   
-  // Fallback: Try JavaScript Date object
   try {
     let date = new Date(str)
     if (!isNaN(date.getTime())) {
@@ -81,11 +74,9 @@ async function getSheetData(forceRefresh = false) {
   
   const rows = response.data.values || []
   
-  // Pre-process and index the data for faster filtering
   const indexedData = {
     rows: rows,
     lastUpdated: Date.now(),
-    // Create indexes for faster lookups
     partyIndex: new Map(),
     consigneeIndex: new Map(),
     billNumberIndex: new Map()
@@ -97,65 +88,59 @@ async function getSheetData(forceRefresh = false) {
     const consignee = row[4]
     const billNo = row[2]
     
-    if (!indexedData.partyIndex.has(party)) {
+    if (party && !indexedData.partyIndex.has(party)) {
       indexedData.partyIndex.set(party, [])
     }
-    indexedData.partyIndex.get(party).push(index)
+    if (party) {
+      indexedData.partyIndex.get(party).push(index)
+    }
     
-    if (!indexedData.consigneeIndex.has(consignee)) {
+    if (consignee && !indexedData.consigneeIndex.has(consignee)) {
       indexedData.consigneeIndex.set(consignee, [])
     }
-    indexedData.consigneeIndex.get(consignee).push(index)
+    if (consignee) {
+      indexedData.consigneeIndex.get(consignee).push(index)
+    }
     
     if (billNo) {
       indexedData.billNumberIndex.set(billNo, index)
     }
   })
   
-  dataCache.set(cacheKey, indexedData, 60) // Cache for 60 seconds
+  dataCache.set(cacheKey, indexedData, 60)
   return indexedData
 }
 
 // ============================================================
-// GET FILTERED DATA - OPTIMIZED VERSION
+// GET FILTERED DATA - FAST OPTIMIZED VERSION
 // ============================================================
 router.get("/", async (req, res) => {
   const startTime = Date.now()
   
   try {
-    console.log("\n" + "=".repeat(60))
-    console.log("📊 GET FILTERED DATA (Optimized)")
-    console.log("=".repeat(60))
+    const { startDate, endDate, parties, consignees, skipCache } = req.query
     
-    const { startDate, endDate, parties, consignees } = req.query
-    
-    // Create cache key based on query parameters
     const cacheKey = `filtered_${startDate || 'none'}_${endDate || 'none'}_${parties || 'none'}_${consignees || 'none'}`
     
-    // Check cache first
-    const cachedResult = cache.get(cacheKey)
-    if (cachedResult) {
-      console.log("✅ Returning cached result")
-      console.log(`⏱️ Response time: ${Date.now() - startTime}ms (cached)`)
-      return res.json(cachedResult)
+    // Skip cache if requested
+    if (skipCache !== 'true') {
+      const cachedResult = cache.get(cacheKey)
+      if (cachedResult) {
+        console.log(`✅ Returning cached result (${cachedResult.length} records)`)
+        console.log(`⏱️ Response time: ${Date.now() - startTime}ms (cached)`)
+        return res.json(cachedResult)
+      }
     }
     
-    const partyList = parties ? parties.split(",") : []
-    const consigneeList = consignees ? consignees.split(",") : []
+    const partyList = parties && parties !== 'none' ? parties.split(",") : []
+    const consigneeList = consignees && consignees !== 'none' ? consignees.split(",") : []
     
-    console.log(`📅 Date Filter: ${startDate || 'NO'} to ${endDate || 'NO'}`)
-    console.log(`👥 Parties: ${partyList.length > 0 ? partyList.length : 'ALL'}`)
-    console.log(`👥 Consignees: ${consigneeList.length > 0 ? consigneeList.length : 'ALL'}`)
-    
-    // Get indexed sheet data
     const indexedData = await getSheetData()
     const rows = indexedData.rows
     
-    console.log(`📄 Total rows in sheet: ${rows.length}`)
-    
-    // ========== DATE RANGE PREPARATION (INCLUSIVE START AND END) ==========
+    // Date range preparation
     let startTimestamp = null, endTimestamp = null
-    if (startDate && endDate) {
+    if (startDate && endDate && startDate !== 'none' && endDate !== 'none') {
       const startDateObj = new Date(startDate)
       startDateObj.setHours(0, 0, 0, 0)
       startTimestamp = startDateObj.getTime()
@@ -165,14 +150,10 @@ router.get("/", async (req, res) => {
       endTimestamp = endDateObj.getTime()
     }
     
-    // Optimized filtering with early exits
-    let filtered = []
-    
-    // Determine which rows to process based on filters
+    // Determine rows to process
     let rowsToProcess = null
     
     if (partyList.length > 0) {
-      // Use party index for faster filtering
       rowsToProcess = new Set()
       partyList.forEach(party => {
         const indices = indexedData.partyIndex.get(party)
@@ -183,7 +164,6 @@ router.get("/", async (req, res) => {
     }
     
     if (consigneeList.length > 0 && rowsToProcess) {
-      // Intersection with consignee index
       const finalSet = new Set()
       consigneeList.forEach(consignee => {
         const indices = indexedData.consigneeIndex.get(consignee)
@@ -206,47 +186,36 @@ router.get("/", async (req, res) => {
       })
     }
     
-    // Statistics counters
-    let actual3EmptyCount = 0
-    let plannedForLoopEmptyCount = 0
-    
     // Process rows
     const rowsArray = rowsToProcess ? Array.from(rowsToProcess) : rows.map((_, idx) => idx)
+    const filtered = []
     
     for (const idx of rowsArray) {
       const row = rows[idx]
       
-      // Column mapping
-      const plannedForLoopStr = row[21]   // Column V
-      const party = row[3]                // Column D
-      const consignee = row[4]            // Column E
-      const actual3 = row[22]             // Column W
+      const plannedForLoopStr = row[21]
+      const party = row[3]
+      const consignee = row[4]
+      const actual3 = row[22]
       
-      // Condition 1: ACTUAL3 MUST BE EMPTY
-      const isActual3Empty = !actual3 || actual3.toString().trim() === ""
-      if (!isActual3Empty) continue
-      actual3EmptyCount++
+      // Condition 1: ACTUAL3 must be empty
+      if (actual3 && actual3.toString().trim() !== "") continue
       
-      // Condition 2: PLANNED FOR LOOP MUST NOT BE EMPTY
-      const isPlannedForLoopEmpty = !plannedForLoopStr || plannedForLoopStr.toString().trim() === ""
-      if (isPlannedForLoopEmpty) {
-        plannedForLoopEmptyCount++
-        continue
-      }
+      // Condition 2: PLANNED FOR LOOP must not be empty
+      if (!plannedForLoopStr || plannedForLoopStr.toString().trim() === "") continue
       
-      // Condition 3: Party filter (already handled by index, but double-check if no index)
+      // Condition 3: Party filter
       if (partyList.length > 0 && !partyList.includes(party)) continue
       
-      // Condition 4: Consignee filter (already handled by index, but double-check if no index)
+      // Condition 4: Consignee filter
       if (consigneeList.length > 0 && !consigneeList.includes(consignee)) continue
       
       // Condition 5: Date range filter
       if (startTimestamp && endTimestamp) {
-        let plannedDateObj = null
-        
         try {
           let dateStr = plannedForLoopStr.toString().trim()
           let datePart = dateStr.split(' ')[0]
+          let plannedDateObj = null
           
           if (datePart.includes('/')) {
             const parts = datePart.split('/')
@@ -263,13 +232,11 @@ router.get("/", async (req, res) => {
           const plannedTimestamp = plannedDateObj.getTime()
           
           if (!(plannedTimestamp >= startTimestamp && plannedTimestamp <= endTimestamp)) continue
-          
         } catch (e) {
           continue
         }
       }
       
-      // Add to filtered results
       filtered.push({
         billNo: row[2] || "",
         party: party || "",
@@ -278,16 +245,15 @@ router.get("/", async (req, res) => {
         balance: row[6] || "0",
         plannedForLoop: plannedForLoopStr || "",
         followUp1: row[24] || "",
+        BalanceRemaining: row[12] || "0",
         followCount1: row[26] || "0",
         actual3: row[22] || ""
       })
     }
     
-    console.log(`\n📈 FILTER STATISTICS:`)
-    console.log(`   🎯 FINAL RESULT: ${filtered.length} records`)
-    console.log(`⏱️ Processing time: ${Date.now() - startTime}ms`)
+    console.log(`🎯 FINAL RESULT: ${filtered.length} records in ${Date.now() - startTime}ms`)
     
-    // Cache the result for 15 seconds
+    // Cache for 15 seconds
     cache.set(cacheKey, filtered, 15)
     
     res.json(filtered)
@@ -299,26 +265,23 @@ router.get("/", async (req, res) => {
 })
 
 // ============================================================
-// GET ALL PARTIES - OPTIMIZED WITH CACHE
+// GET ALL PARTIES - FAST WITH LONG CACHE
 // ============================================================
 router.get("/parties", async (req, res) => {
   const startTime = Date.now()
   
   try {
-    // Check cache
     const cachedParties = cache.get('all_parties')
     if (cachedParties) {
-      console.log("✅ Returning cached parties")
+      console.log(`✅ Returning cached parties (${cachedParties.length})`)
       return res.json(cachedParties)
     }
     
     const indexedData = await getSheetData()
     const parties = [...indexedData.partyIndex.keys()].filter(Boolean).sort()
     
-    console.log(`📋 Total unique parties: ${parties.length}`)
-    console.log(`⏱️ Parties fetch time: ${Date.now() - startTime}ms`)
+    console.log(`📋 Total unique parties: ${parties.length} in ${Date.now() - startTime}ms`)
     
-    // Cache for 5 minutes
     cache.set('all_parties', parties, 300)
     
     res.json(parties)
@@ -329,7 +292,7 @@ router.get("/parties", async (req, res) => {
 })
 
 // ============================================================
-// GET CONSIGNEES BASED ON PARTIES - OPTIMIZED WITH CACHE
+// GET CONSIGNEES - FAST WITH CACHE
 // ============================================================
 router.get("/consignees", async (req, res) => {
   const startTime = Date.now()
@@ -338,28 +301,22 @@ router.get("/consignees", async (req, res) => {
     const { parties } = req.query
     const partyList = parties ? parties.split(",") : []
     
-    // Create cache key based on parties
     const cacheKey = `consignees_${parties || 'all'}`
     const cachedConsignees = cache.get(cacheKey)
     
     if (cachedConsignees) {
-      console.log("✅ Returning cached consignees")
+      console.log(`✅ Returning cached consignees (${cachedConsignees.length})`)
       return res.json(cachedConsignees)
     }
     
     const indexedData = await getSheetData()
-    let consigneesSet = new Set()
+    const consigneesSet = new Set()
     
     if (partyList.length === 0) {
-      // Get all consignees
-      for (const [_, indices] of indexedData.consigneeIndex) {
-        indices.forEach(idx => {
-          const consignee = indexedData.rows[idx][4]
-          if (consignee) consigneesSet.add(consignee)
-        })
+      for (const [consignee, indices] of indexedData.consigneeIndex) {
+        if (consignee) consigneesSet.add(consignee)
       }
     } else {
-      // Get consignees for specific parties
       for (const party of partyList) {
         const partyIndices = indexedData.partyIndex.get(party)
         if (partyIndices) {
@@ -372,10 +329,8 @@ router.get("/consignees", async (req, res) => {
     }
     
     const uniqueConsignees = Array.from(consigneesSet).sort()
-    console.log(`📋 Found ${uniqueConsignees.length} consignees for selected parties`)
-    console.log(`⏱️ Consignees fetch time: ${Date.now() - startTime}ms`)
+    console.log(`📋 Found ${uniqueConsignees.length} consignees in ${Date.now() - startTime}ms`)
     
-    // Cache for 2 minutes
     cache.set(cacheKey, uniqueConsignees, 120)
     
     res.json(uniqueConsignees)
@@ -386,7 +341,7 @@ router.get("/consignees", async (req, res) => {
 })
 
 // ============================================================
-// SINGLE FOLLOW-UP UPDATE - OPTIMIZED
+// SINGLE FOLLOW-UP UPDATE
 // ============================================================
 router.post("/update-followup-single", async (req, res) => {
   try {
@@ -395,8 +350,7 @@ router.post("/update-followup-single", async (req, res) => {
     
     console.log(`✏️ Single update: ${billNumber} -> ${followUpDate}`)
     
-    // Try to get from cache first
-    const indexedData = await getSheetData()
+    const indexedData = await getSheetData(true) // Force refresh
     const rowIndex = indexedData.billNumberIndex.get(billNumber)
     
     if (rowIndex !== undefined) {
@@ -417,7 +371,7 @@ router.post("/update-followup-single", async (req, res) => {
         }
       })
       
-      // Invalidate caches after update
+      // Clear all caches
       cache.flushAll()
       dataCache.del('sheet_data')
       
@@ -434,7 +388,7 @@ router.post("/update-followup-single", async (req, res) => {
 })
 
 // ============================================================
-// BULK FOLLOW-UP UPDATE - OPTIMIZED
+// BULK FOLLOW-UP UPDATE - FAST BATCH PROCESSING
 // ============================================================
 router.post("/update-followup", async (req, res) => {
   try {
@@ -443,10 +397,10 @@ router.post("/update-followup", async (req, res) => {
     
     console.log(`✏️ Bulk update: ${billNumbers.length} bills -> ${followUpDate}`)
     
-    const indexedData = await getSheetData()
+    const indexedData = await getSheetData(true) // Force refresh
     const formattedDate = getDateOnly(followUpDate) || followUpDate
     
-    let updates = []
+    const updates = []
     let updatedCount = 0
     
     for (const billNumber of billNumbers) {
@@ -465,7 +419,6 @@ router.post("/update-followup", async (req, res) => {
     }
     
     if (updates.length > 0) {
-      // Batch updates in chunks of 50 to avoid API limits
       const chunkSize = 50
       for (let i = 0; i < updates.length; i += chunkSize) {
         const chunk = updates.slice(i, i + chunkSize)
@@ -479,7 +432,7 @@ router.post("/update-followup", async (req, res) => {
       }
     }
     
-    // Invalidate caches after update
+    // Clear all caches
     cache.flushAll()
     dataCache.del('sheet_data')
     
@@ -492,13 +445,26 @@ router.post("/update-followup", async (req, res) => {
 })
 
 // ============================================================
-// CLEAR CACHE ENDPOINT (for debugging)
+// CLEAR CACHE ENDPOINT
 // ============================================================
 router.post("/clear-cache", (req, res) => {
   cache.flushAll()
   dataCache.del('sheet_data')
-  console.log("🗑️ Cache cleared")
+  console.log("🗑️ All cache cleared")
   res.json({ success: true, message: "Cache cleared" })
+})
+
+// ============================================================
+// GET CACHE STATUS (for debugging)
+// ============================================================
+router.get("/cache-status", (req, res) => {
+  const stats = {
+    cacheKeys: cache.keys(),
+    cacheSize: cache.keys().length,
+    dataCacheKeys: dataCache.keys(),
+    dataCacheSize: dataCache.keys().length
+  }
+  res.json(stats)
 })
 
 module.exports = router
