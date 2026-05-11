@@ -2,73 +2,75 @@ const router = require("express").Router()
 const getSheets = require("../googleSheet")
 const NodeCache = require("node-cache")
 
-// Initialize cache with different TTLs
+// Initialize cache
 const cache = new NodeCache({ stdTTL: 300, checkperiod: 120 })
 const dataCache = new NodeCache({ stdTTL: 30, checkperiod: 60 })
 
-// Helper: Normalize string (remove extra spaces, handle commas)
+// Helper functions
 function normalizeString(str) {
   if (!str) return ""
-  return str
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/ ,/g, ",")
-    .replace(/, /g, ",")
-    .replace(/\s*,\s*/g, ",")
-    .trim()
+  return str.toString().trim().toLowerCase().replace(/\s+/g, " ").replace(/\s*,\s*/g, ",").trim()
 }
 
-// Helper: Parse special parameter (handles ||| separator and commas)
 function parseSpecialParam(paramStr) {
   if (!paramStr || paramStr === 'none' || paramStr === '') return []
-  
-  // Decode first
-  const decoded = decodeURIComponent(paramStr)
-  
-  // Check if using special separator '|||'
-  if (decoded.includes('|||')) {
-    return decoded.split('|||').map(p => p.trim())
+  try {
+    const decoded = decodeURIComponent(paramStr)
+    if (decoded.includes('|||')) {
+      return decoded.split('|||').map(p => p.trim())
+    }
+    return [decoded.trim()]
+  } catch (e) {
+    if (paramStr.includes('|||')) {
+      return paramStr.split('|||').map(p => p.trim())
+    }
+    return [paramStr.trim()]
   }
-  
-  // Single value
-  return [decoded.trim()]
 }
 
-// Helper: Convert DD/MM/YYYY to YYYY-MM-DD
-function convertToStandardDate(dateStr) {
-  if (!dateStr) return null
+function isDateInRange(dateStr, startTimestamp, endTimestamp) {
+  if (!dateStr) return false
+  if (!startTimestamp || !endTimestamp) return true
   
-  const str = dateStr.toString().trim()
-  if (str === "") return null
-  
+  try {
+    let datePart = dateStr.toString().trim().split(' ')[0]
+    let plannedDateObj = null
+    
+    if (datePart.includes('/')) {
+      const parts = datePart.split('/')
+      plannedDateObj = new Date(parts[2], parts[1] - 1, parts[0])
+    } else if (datePart.includes('-')) {
+      plannedDateObj = new Date(datePart)
+    } else {
+      plannedDateObj = new Date(dateStr)
+    }
+    
+    if (isNaN(plannedDateObj.getTime())) return false
+    
+    plannedDateObj.setHours(0, 0, 0, 0)
+    const plannedTimestamp = plannedDateObj.getTime()
+    
+    return (plannedTimestamp >= startTimestamp && plannedTimestamp <= endTimestamp)
+  } catch (e) {
+    return false
+  }
+}
+
+function getDateOnly(dateString) {
+  if (!dateString || dateString.toString().trim() === "") return null
+  const str = dateString.toString().trim()
   const datePart = str.split(' ')[0]
   
   if (datePart.includes('/')) {
     const parts = datePart.split('/')
     if (parts.length === 3) {
-      const year = parts[2]
-      const month = parts[1].padStart(2, '0')
-      const day = parts[0].padStart(2, '0')
-      return `${year}-${month}-${day}`
+      return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`
     }
   }
   
   if (datePart.includes('-')) {
     return datePart
   }
-  
-  return null
-}
-
-function getDateOnly(dateString) {
-  if (!dateString || dateString.toString().trim() === "") return null
-  
-  const str = dateString.toString().trim()
-  
-  let converted = convertToStandardDate(str)
-  if (converted) return converted
   
   try {
     let date = new Date(str)
@@ -78,18 +80,18 @@ function getDateOnly(dateString) {
   } catch (e) {
     return null
   }
-  
   return null
 }
 
-// Optimized: Get all sheet data with caching
-async function getSheetData(forceRefresh = false) {
-  const cacheKey = 'sheet_data'
+// ============================================================
+// CORE FUNCTION: Get pending rows
+// ============================================================
+async function getPendingRowsWithDateFilter(startTimestamp, endTimestamp, forceRefresh = false) {
+  const cacheKey = `pending_rows_${startTimestamp || 'none'}_${endTimestamp || 'none'}`
   
   if (!forceRefresh) {
     const cachedData = dataCache.get(cacheKey)
     if (cachedData) {
-      console.log("📦 Using cached sheet data")
       return cachedData
     }
   }
@@ -103,91 +105,46 @@ async function getSheetData(forceRefresh = false) {
   })
   
   const rows = response.data.values || []
+  const pendingRows = []
   
-  const indexedData = {
-    rows: rows,
-    lastUpdated: Date.now(),
-    partyIndex: new Map(),
-    normalizedPartyIndex: new Map(),
-    consigneeIndex: new Map(),
-    normalizedConsigneeIndex: new Map(),
-    billNumberIndex: new Map()
+  for (let idx = 0; idx < rows.length; idx++) {
+    const row = rows[idx]
+    const actual3 = row[22]
+    const plannedForLoop = row[21]
+    
+    if ((!actual3 || actual3.toString().trim() === "") && 
+        (plannedForLoop && plannedForLoop.toString().trim() !== "")) {
+      
+      if (startTimestamp && endTimestamp) {
+        if (isDateInRange(plannedForLoop, startTimestamp, endTimestamp)) {
+          pendingRows.push({ index: idx, row: row })
+        }
+      } else {
+        pendingRows.push({ index: idx, row: row })
+      }
+    }
   }
   
-  // Build indexes
-  rows.forEach((row, index) => {
-    const party = row[3]
-    const consignee = row[4]
-    const billNo = row[2]
-    
-    if (party) {
-      if (!indexedData.partyIndex.has(party)) {
-        indexedData.partyIndex.set(party, [])
-      }
-      indexedData.partyIndex.get(party).push(index)
-      
-      const normalizedParty = normalizeString(party)
-      if (!indexedData.normalizedPartyIndex.has(normalizedParty)) {
-        indexedData.normalizedPartyIndex.set(normalizedParty, [])
-      }
-      indexedData.normalizedPartyIndex.get(normalizedParty).push(index)
-    }
-    
-    if (consignee) {
-      if (!indexedData.consigneeIndex.has(consignee)) {
-        indexedData.consigneeIndex.set(consignee, [])
-      }
-      indexedData.consigneeIndex.get(consignee).push(index)
-      
-      const normalizedConsignee = normalizeString(consignee)
-      if (!indexedData.normalizedConsigneeIndex.has(normalizedConsignee)) {
-        indexedData.normalizedConsigneeIndex.set(normalizedConsignee, [])
-      }
-      indexedData.normalizedConsigneeIndex.get(normalizedConsignee).push(index)
-    }
-    
-    if (billNo) {
-      indexedData.billNumberIndex.set(billNo, index)
-    }
-  })
+  const result = {
+    rows: pendingRows,
+    totalPending: pendingRows.length,
+    lastUpdated: Date.now()
+  }
   
-  dataCache.set(cacheKey, indexedData, 60)
-  return indexedData
+  dataCache.set(cacheKey, result, 60)
+  console.log(`📊 Found ${pendingRows.length} pending rows`)
+  return result
 }
 
 // ============================================================
-// GET FILTERED DATA
+// GET ALL PARTIES
 // ============================================================
-router.get("/", async (req, res) => {
-  const startTime = Date.now()
-  
+router.get("/parties", async (req, res) => {
   try {
-    const { startDate, endDate, parties, consignees, skipCache } = req.query
+    const { startDate, endDate } = req.query
     
-    const cacheKey = `filtered_${startDate || 'none'}_${endDate || 'none'}_${parties || 'none'}_${consignees || 'none'}`
-    
-    if (skipCache !== 'true') {
-      const cachedResult = cache.get(cacheKey)
-      if (cachedResult) {
-        console.log(`✅ Returning cached result (${cachedResult.length} records)`)
-        return res.json(cachedResult)
-      }
-    }
-    
-    // Parse parameters
-    const partyListRaw = parseSpecialParam(parties || '')
-    const consigneeListRaw = parseSpecialParam(consignees || '')
-    
-    // Normalize for matching
-    const partyListNorm = partyListRaw.map(p => normalizeString(p))
-    const consigneeListNorm = consigneeListRaw.map(c => normalizeString(c))
-    
-    const indexedData = await getSheetData()
-    const rows = indexedData.rows
-    
-    // Date range preparation
     let startTimestamp = null, endTimestamp = null
-    if (startDate && endDate && startDate !== 'none' && endDate !== 'none') {
+    if (startDate && endDate && startDate !== 'undefined' && endDate !== 'undefined' && startDate !== '' && endDate !== '') {
       const startDateObj = new Date(startDate)
       startDateObj.setHours(0, 0, 0, 0)
       startTimestamp = startDateObj.getTime()
@@ -197,62 +154,131 @@ router.get("/", async (req, res) => {
       endTimestamp = endDateObj.getTime()
     }
     
-    const filtered = []
+    const cacheKey = `parties_${startTimestamp || 'none'}_${endTimestamp || 'none'}`
+    const cachedParties = cache.get(cacheKey)
     
-    for (let idx = 0; idx < rows.length; idx++) {
-      const row = rows[idx]
+    if (cachedParties) {
+      return res.json(cachedParties)
+    }
+    
+    const pendingData = await getPendingRowsWithDateFilter(startTimestamp, endTimestamp)
+    
+    const partiesSet = new Set()
+    for (const item of pendingData.rows) {
+      const party = item.row[3]
+      if (party && party.toString().trim() !== "") {
+        partiesSet.add(party.toString().trim())
+      }
+    }
+    
+    const parties = Array.from(partiesSet).sort()
+    cache.set(cacheKey, parties, 300)
+    res.json(parties)
+    
+  } catch (error) {
+    console.error("❌ Error in /parties:", error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// ============================================================
+// GET CONSIGNEES
+// ============================================================
+router.get("/consignees", async (req, res) => {
+  try {
+    const { parties, startDate, endDate } = req.query
+    const partyListRaw = parseSpecialParam(parties || '')
+    
+    let startTimestamp = null, endTimestamp = null
+    if (startDate && endDate && startDate !== 'undefined' && endDate !== 'undefined' && startDate !== '' && endDate !== '') {
+      const startDateObj = new Date(startDate)
+      startDateObj.setHours(0, 0, 0, 0)
+      startTimestamp = startDateObj.getTime()
       
-      const plannedForLoopStr = row[21]
+      const endDateObj = new Date(endDate)
+      endDateObj.setHours(23, 59, 59, 999)
+      endTimestamp = endDateObj.getTime()
+    }
+    
+    const cacheKey = `consignees_${parties || 'all'}_${startTimestamp || 'none'}_${endTimestamp || 'none'}`
+    const cachedConsignees = cache.get(cacheKey)
+    
+    if (cachedConsignees) {
+      return res.json(cachedConsignees)
+    }
+    
+    const pendingData = await getPendingRowsWithDateFilter(startTimestamp, endTimestamp)
+    
+    const consigneesMap = new Map()
+    const partyListNorm = partyListRaw.map(p => normalizeString(p))
+    
+    for (const item of pendingData.rows) {
+      const party = item.row[3]
+      const consignee = item.row[4]
+      
+      if (!consignee || consignee.toString().trim() === "") continue
+      
+      if (partyListRaw.length === 0) {
+        const original = consignee.toString().trim()
+        consigneesMap.set(normalizeString(original), original)
+      } else if (party && partyListNorm.includes(normalizeString(party))) {
+        const original = consignee.toString().trim()
+        consigneesMap.set(normalizeString(original), original)
+      }
+    }
+    
+    const uniqueConsignees = Array.from(consigneesMap.values()).sort()
+    cache.set(cacheKey, uniqueConsignees, 120)
+    res.json(uniqueConsignees)
+    
+  } catch (error) {
+    console.error("❌ Error in /consignees:", error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// ============================================================
+// GET FILTERED DATA
+// ============================================================
+router.get("/", async (req, res) => {
+  try {
+    const { startDate, endDate, parties, consignees, skipCache } = req.query
+    
+    let startTimestamp = null, endTimestamp = null
+    if (startDate && endDate && startDate !== 'undefined' && endDate !== 'undefined' && startDate !== '' && endDate !== '') {
+      const startDateObj = new Date(startDate)
+      startDateObj.setHours(0, 0, 0, 0)
+      startTimestamp = startDateObj.getTime()
+      
+      const endDateObj = new Date(endDate)
+      endDateObj.setHours(23, 59, 59, 999)
+      endTimestamp = endDateObj.getTime()
+    }
+    
+    const cacheKey = `filtered_${startTimestamp || 'none'}_${endTimestamp || 'none'}_${parties || 'none'}_${consignees || 'none'}`
+    
+    if (skipCache !== 'true') {
+      const cachedResult = cache.get(cacheKey)
+      if (cachedResult) {
+        return res.json(cachedResult)
+      }
+    }
+    
+    const partyListRaw = parseSpecialParam(parties || '')
+    const consigneeListRaw = parseSpecialParam(consignees || '')
+    const partyListNorm = partyListRaw.map(p => normalizeString(p))
+    const consigneeListNorm = consigneeListRaw.map(c => normalizeString(c))
+    
+    const pendingData = await getPendingRowsWithDateFilter(startTimestamp, endTimestamp, skipCache === 'true')
+    
+    const filtered = []
+    for (const item of pendingData.rows) {
+      const row = item.row
       const party = row[3]
       const consignee = row[4]
-      const actual3 = row[22]
       
-      // Condition 1: ACTUAL3 must be empty
-      if (actual3 && actual3.toString().trim() !== "") continue
-      
-      // Condition 2: PLANNED FOR LOOP must not be empty
-      if (!plannedForLoopStr || plannedForLoopStr.toString().trim() === "") continue
-      
-      // Condition 3: Party filter
-      if (partyListRaw.length > 0) {
-        if (!party) continue
-        const normalizedParty = normalizeString(party)
-        if (!partyListNorm.includes(normalizedParty)) continue
-      }
-      
-      // Condition 4: Consignee filter
-      if (consigneeListRaw.length > 0) {
-        if (!consignee) continue
-        const normalizedConsignee = normalizeString(consignee)
-        if (!consigneeListNorm.includes(normalizedConsignee)) continue
-      }
-      
-      // Condition 5: Date range filter
-      if (startTimestamp && endTimestamp) {
-        try {
-          let dateStr = plannedForLoopStr.toString().trim()
-          let datePart = dateStr.split(' ')[0]
-          let plannedDateObj = null
-          
-          if (datePart.includes('/')) {
-            const parts = datePart.split('/')
-            plannedDateObj = new Date(parts[2], parts[1] - 1, parts[0])
-          } else if (datePart.includes('-')) {
-            plannedDateObj = new Date(datePart)
-          } else {
-            plannedDateObj = new Date(dateStr)
-          }
-          
-          if (isNaN(plannedDateObj.getTime())) continue
-          
-          plannedDateObj.setHours(0, 0, 0, 0)
-          const plannedTimestamp = plannedDateObj.getTime()
-          
-          if (!(plannedTimestamp >= startTimestamp && plannedTimestamp <= endTimestamp)) continue
-        } catch (e) {
-          continue
-        }
-      }
+      if (partyListRaw.length > 0 && (!party || !partyListNorm.includes(normalizeString(party)))) continue
+      if (consigneeListRaw.length > 0 && (!consignee || !consigneeListNorm.includes(normalizeString(consignee)))) continue
       
       filtered.push({
         billNo: row[2] || "",
@@ -260,7 +286,7 @@ router.get("/", async (req, res) => {
         consignee: consignee || "",
         billDate: row[1] || "",
         balance: row[6] || "0",
-        plannedForLoop: plannedForLoopStr || "",
+        plannedForLoop: row[21] || "",
         followUp1: row[24] || "",
         BalanceRemaining: row[12] || "0",
         followCount1: row[26] || "0",
@@ -268,176 +294,17 @@ router.get("/", async (req, res) => {
       })
     }
     
-    console.log(`🎯 FINAL RESULT: ${filtered.length} records in ${Date.now() - startTime}ms`)
-    
     cache.set(cacheKey, filtered, 15)
     res.json(filtered)
     
   } catch (error) {
     console.error("❌ ERROR:", error)
-    res.status(500).json({ error: "Filter failed: " + error.message })
+    res.status(500).json({ error: error.message })
   }
 })
 
 // ============================================================
-// GET ALL PARTIES
-// ============================================================
-router.get("/parties", async (req, res) => {
-  const startTime = Date.now()
-  
-  try {
-    const cachedParties = cache.get('all_parties')
-    if (cachedParties) {
-      console.log(`✅ Returning cached parties (${cachedParties.length})`)
-      return res.json(cachedParties)
-    }
-    
-    const indexedData = await getSheetData()
-    const parties = [...indexedData.partyIndex.keys()].filter(Boolean).sort()
-    
-    console.log(`📋 Total unique parties: ${parties.length} in ${Date.now() - startTime}ms`)
-    
-    cache.set('all_parties', parties, 300)
-    res.json(parties)
-  } catch (error) {
-    console.error(error)
-    res.status(500).json({ error: "Failed to get parties" })
-  }
-})
-
-// ============================================================
-// GET CONSIGNEES - FIXED
-// ============================================================
-router.get("/consignees", async (req, res) => {
-  const startTime = Date.now()
-  
-  try {
-    const { parties } = req.query
-    const partyListRaw = parseSpecialParam(parties || '')
-    
-    const cacheKey = `consignees_${parties || 'all'}`
-    const cachedConsignees = cache.get(cacheKey)
-    
-    if (cachedConsignees) {
-      console.log(`✅ Returning cached consignees (${cachedConsignees.length})`)
-      return res.json(cachedConsignees)
-    }
-    
-    const indexedData = await getSheetData()
-    const consigneesMap = new Map() // normalized key -> original name
-    
-    console.log(`\n🔍 Fetching consignees for parties:`, partyListRaw)
-    
-    if (partyListRaw.length === 0) {
-      // No filter - return ALL unique consignees
-      console.log("🔍 Fetching ALL consignees...")
-      for (const row of indexedData.rows) {
-        const consignee = row[4]
-        if (consignee && consignee.toString().trim() !== "") {
-          const original = consignee.toString().trim()
-          const key = normalizeString(original)
-          if (!consigneesMap.has(key)) {
-            consigneesMap.set(key, original)
-          }
-        }
-      }
-    } else {
-      // With party filter
-      const partyListNorm = partyListRaw.map(p => normalizeString(p))
-      
-      // Find all rows matching the parties
-      for (let idx = 0; idx < indexedData.rows.length; idx++) {
-        const row = indexedData.rows[idx]
-        const dealer = row[3]
-        const consignee = row[4]
-        
-        if (!dealer || !consignee) continue
-        
-        const normalizedDealer = normalizeString(dealer)
-        
-        if (partyListNorm.includes(normalizedDealer)) {
-          const originalConsignee = consignee.toString().trim()
-          const key = normalizeString(originalConsignee)
-          if (!consigneesMap.has(key)) {
-            consigneesMap.set(key, originalConsignee)
-            console.log(`  Found: Dealer="${dealer}" -> Consignee="${originalConsignee}"`)
-          }
-        }
-      }
-    }
-    
-    const uniqueConsignees = Array.from(consigneesMap.values()).sort()
-    console.log(`\n📋 Total unique consignees: ${uniqueConsignees.length} in ${Date.now() - startTime}ms`)
-    
-    cache.set(cacheKey, uniqueConsignees, 120)
-    res.json(uniqueConsignees)
-    
-  } catch (error) {
-    console.error("❌ Error in /consignees:", error)
-    res.status(500).json({ error: "Failed to get consignees: " + error.message })
-  }
-})
-
-// ============================================================
-// SINGLE FOLLOW-UP UPDATE - FIXED (No batchUpdate)
-// ============================================================
-router.post("/update-followup-single", async (req, res) => {
-  try {
-    const sheets = await getSheets()
-    const { billNumber, followUpDate } = req.body
-    
-    if (!billNumber) {
-      return res.status(400).json({ error: "Bill number is required" })
-    }
-    
-    console.log(`✏️ Single update: ${billNumber} -> ${followUpDate}`)
-    
-    const indexedData = await getSheetData(true)
-    const rowIndex = indexedData.billNumberIndex.get(billNumber)
-    
-    if (rowIndex !== undefined) {
-      const sheetRow = rowIndex + 8
-      const row = indexedData.rows[rowIndex]
-      const followCount = parseInt(row[26] || "0")
-      
-      const formattedDate = getDateOnly(followUpDate) || followUpDate || new Date().toISOString().split('T')[0]
-      
-      // FIX: Use separate update calls instead of batchUpdate
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: `${process.env.SHEET_NAME}!Y${sheetRow}`,
-        valueInputOption: "USER_ENTERED",
-        requestBody: {
-          values: [[formattedDate]]
-        }
-      })
-      
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        range: `${process.env.SHEET_NAME}!AA${sheetRow}`,
-        valueInputOption: "USER_ENTERED",
-        requestBody: {
-          values: [[followCount + 1]]
-        }
-      })
-      
-      cache.flushAll()
-      dataCache.del('sheet_data')
-      
-      console.log(`✅ Updated successfully`)
-      res.json({ success: true, message: "Follow-up updated successfully" })
-    } else {
-      console.log(`❌ Bill number ${billNumber} not found`)
-      res.status(404).json({ success: false, error: "Bill number not found" })
-    }
-  } catch (err) {
-    console.error("❌ Error:", err)
-    res.status(500).json({ error: "Update failed: " + err.message })
-  }
-})
-
-// ============================================================
-// BULK FOLLOW-UP UPDATE - FIXED (No batchUpdate, with delay)
+// BULK FOLLOW-UP UPDATE - USING BATCH UPDATE (FIXED)
 // ============================================================
 router.post("/update-followup", async (req, res) => {
   try {
@@ -450,110 +317,170 @@ router.post("/update-followup", async (req, res) => {
     
     console.log(`✏️ Bulk update: ${billNumbers.length} bills -> ${followUpDate}`)
     
-    const indexedData = await getSheetData(true)
-    const formattedDate = getDateOnly(followUpDate) || followUpDate || new Date().toISOString().split('T')[0]
+    // Get fresh data to find row indices
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${process.env.SHEET_NAME}!A8:AU`,
+      majorDimension: 'ROWS'
+    })
     
-    let updatedCount = 0
+    const rows = response.data.values || []
+    
+    // Create mapping of bill number to row index
+    const billToRowMap = new Map()
+    rows.forEach((row, index) => {
+      if (row[2]) billToRowMap.set(row[2].toString(), index)
+    })
+    
+    const formattedDate = getDateOnly(followUpDate) || new Date().toISOString().split('T')[0]
+    
+    // Prepare batch updates
+    const updateRequests = []
     const notFound = []
-    const errors = []
     
-    // FIX: Use separate update calls with delay
     for (const billNumber of billNumbers) {
-      const rowIndex = indexedData.billNumberIndex.get(billNumber)
+      const rowIndex = billToRowMap.get(billNumber.toString())
       if (rowIndex !== undefined) {
         const sheetRow = rowIndex + 8
-        const row = indexedData.rows[rowIndex]
-        const followCount = parseInt(row[26] || "0")
+        const followCount = parseInt(rows[rowIndex][26] || "0")
         
-        try {
-          // Update Y column
-          await sheets.spreadsheets.values.update({
-            spreadsheetId: process.env.GOOGLE_SHEET_ID,
-            range: `${process.env.SHEET_NAME}!Y${sheetRow}`,
-            valueInputOption: "USER_ENTERED",
-            requestBody: {
-              values: [[formattedDate]]
-            }
-          })
-          
-          // Update AA column
-          await sheets.spreadsheets.values.update({
-            spreadsheetId: process.env.GOOGLE_SHEET_ID,
-            range: `${process.env.SHEET_NAME}!AA${sheetRow}`,
-            valueInputOption: "USER_ENTERED",
-            requestBody: {
-              values: [[followCount + 1]]
-            }
-          })
-          
-          updatedCount++
-          console.log(`✅ Updated bill: ${billNumber} at row ${sheetRow}`)
-          
-          // Add small delay to avoid rate limiting and expansion errors
-          await new Promise(resolve => setTimeout(resolve, 200))
-          
-        } catch (err) {
-          console.error(`❌ Error updating bill ${billNumber}:`, err.message)
-          errors.push({ billNumber, error: err.message })
-        }
+        // Add update for Y column (Follow Up Date)
+        updateRequests.push({
+          range: `${process.env.SHEET_NAME}!Y${sheetRow}`,
+          values: [[formattedDate]]
+        })
+        
+        // Add update for AA column (Follow Count)
+        updateRequests.push({
+          range: `${process.env.SHEET_NAME}!AA${sheetRow}`,
+          values: [[followCount + 1]]
+        })
       } else {
         notFound.push(billNumber)
-        console.log(`⚠️ Bill number not found: ${billNumber}`)
       }
     }
     
+    if (updateRequests.length === 0) {
+      return res.json({ success: true, updatedCount: 0, notFound, message: "No valid bills found" })
+    }
+    
+    // Split into batches of 50 to avoid exceeding batch limits
+    const BATCH_SIZE = 50
+    let totalUpdated = 0
+    
+    for (let i = 0; i < updateRequests.length; i += BATCH_SIZE) {
+      const batch = updateRequests.slice(i, i + BATCH_SIZE)
+      
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        requestBody: {
+          valueInputOption: "USER_ENTERED",
+          data: batch
+        }
+      })
+      
+      totalUpdated += batch.length / 2 // Each bill has 2 updates
+      console.log(`✅ Batch ${Math.floor(i / BATCH_SIZE) + 1} completed: ${batch.length / 2} bills`)
+      
+      // Small delay between batches to avoid rate limiting
+      if (i + BATCH_SIZE < updateRequests.length) {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      }
+    }
+    
+    // Clear all caches
     cache.flushAll()
-    dataCache.del('sheet_data')
+    dataCache.flushAll()
     
-    console.log(`✅ Updated ${updatedCount} bills, ${notFound.length} not found, ${errors.length} errors`)
-    
+    console.log(`✅ Total updated: ${totalUpdated} bills, ${notFound.length} not found`)
     res.json({ 
       success: true, 
-      updatedCount: updatedCount, 
+      updatedCount: totalUpdated, 
       notFound: notFound,
-      errors: errors,
-      message: `Updated ${updatedCount} bills successfully` 
+      message: `${totalUpdated} bills updated successfully`
     })
+    
+  } catch (err) {
+    console.error("❌ Error in bulk update:", err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================================
+// SINGLE FOLLOW-UP UPDATE
+// ============================================================
+router.post("/update-followup-single", async (req, res) => {
+  try {
+    const sheets = await getSheets()
+    const { billNumber, followUpDate } = req.body
+    
+    if (!billNumber) {
+      return res.status(400).json({ error: "Bill number is required" })
+    }
+    
+    console.log(`✏️ Single update: ${billNumber} -> ${followUpDate}`)
+    
+    // Get fresh data
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${process.env.SHEET_NAME}!A8:AU`,
+      majorDimension: 'ROWS'
+    })
+    
+    const rows = response.data.values || []
+    let rowIndex = -1
+    
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i][2] === billNumber) {
+        rowIndex = i
+        break
+      }
+    }
+    
+    if (rowIndex !== -1) {
+      const sheetRow = rowIndex + 8
+      const followCount = parseInt(rows[rowIndex][26] || "0")
+      const formattedDate = getDateOnly(followUpDate) || new Date().toISOString().split('T')[0]
+      
+      // Use batch update for single too (consistent)
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        requestBody: {
+          valueInputOption: "USER_ENTERED",
+          data: [
+            {
+              range: `${process.env.SHEET_NAME}!Y${sheetRow}`,
+              values: [[formattedDate]]
+            },
+            {
+              range: `${process.env.SHEET_NAME}!AA${sheetRow}`,
+              values: [[followCount + 1]]
+            }
+          ]
+        }
+      })
+      
+      cache.flushAll()
+      dataCache.flushAll()
+      
+      res.json({ success: true, message: "Follow-up updated successfully" })
+    } else {
+      res.status(404).json({ success: false, error: "Bill number not found" })
+    }
   } catch (err) {
     console.error("❌ Error:", err)
-    res.status(500).json({ error: "Update failed: " + err.message })
+    res.status(500).json({ error: err.message })
   }
 })
 
-// ============================================================
-// CLEAR CACHE ENDPOINT
-// ============================================================
 router.post("/clear-cache", (req, res) => {
   cache.flushAll()
-  dataCache.del('sheet_data')
-  console.log("🗑️ All cache cleared")
-  res.json({ success: true, message: "Cache cleared successfully" })
+  dataCache.flushAll()
+  res.json({ success: true })
 })
 
-// ============================================================
-// GET CACHE STATUS
-// ============================================================
-router.get("/cache-status", (req, res) => {
-  const stats = {
-    cacheKeys: cache.keys(),
-    cacheSize: cache.keys().length,
-    cacheStats: cache.getStats(),
-    dataCacheKeys: dataCache.keys(),
-    dataCacheSize: dataCache.keys().length,
-    timestamp: new Date().toISOString()
-  }
-  res.json(stats)
-})
-
-// ============================================================
-// HEALTH CHECK
-// ============================================================
 router.get("/health", (req, res) => {
-  res.json({ 
-    status: "OK", 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  })
+  res.json({ status: "OK", timestamp: new Date().toISOString() })
 })
 
 module.exports = router
